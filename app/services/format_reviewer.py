@@ -1,5 +1,3 @@
-"""Caso de uso: revisar el formato de un documento a partir de su imagen."""
-
 import io
 
 from PIL import Image, UnidentifiedImageError
@@ -12,11 +10,11 @@ from app.domain.models import (
     ReviewResult,
     Severity,
 )
+from app.domain.ports import EntityExtractor, OcrEngine
 from app.services.document_types import detect_document_type
-from app.services.entity_extractor import EntityExtractor
-from app.services.ocr import OcrEngine
 from app.services.rules import DEFAULT_RULES, Rule, RuleContext
 
+MAX_SCORE = 100
 PENALTIES = {
     Severity.HIGH: 40,
     Severity.MEDIUM: 20,
@@ -24,9 +22,7 @@ PENALTIES = {
 }
 
 
-class RevisorFormato:
-    """Orquesta OCR, modelo y reglas; no conoce detalles de HTTP."""
-
+class FormatReviewer:
     def __init__(
         self,
         ocr: OcrEngine,
@@ -40,29 +36,30 @@ class RevisorFormato:
         self._rules = rules
 
     def review(self, content: bytes) -> ReviewResult:
-        image = self._open_image(content)
-        words = self._ocr.extract(image)
-        entities = self._extractor.extract(image, words)
-        analysis = DocumentAnalysis(tuple(words), tuple(entities))
-
+        analysis = self._analyze(self._open_image(content))
         detected_type = detect_document_type(analysis)
-        context = RuleContext(analysis, detected_type)
-        findings = [
-            finding
-            for finding in (rule(context) for rule in self._rules)
-            if finding is not None
-        ]
+        findings = self._evaluate_rules(RuleContext(analysis, detected_type))
         score = self._score(findings)
-        complies = score >= self._min_passing_score and not any(
-            finding.severity is Severity.HIGH for finding in findings
-        )
         return ReviewResult(
-            complies=complies,
+            complies=self._complies(score, findings),
             score=score,
             detected_type=detected_type,
             summary=self._summary(analysis, detected_type, findings),
             findings=findings,
         )
+
+    def _analyze(self, image: Image.Image) -> DocumentAnalysis:
+        words = self._ocr.extract(image)
+        entities = self._extractor.extract(image, words)
+        return DocumentAnalysis(tuple(words), tuple(entities))
+
+    def _evaluate_rules(self, context: RuleContext) -> list[Finding]:
+        findings = (rule(context) for rule in self._rules)
+        return [finding for finding in findings if finding is not None]
+
+    def _complies(self, score: int, findings: list[Finding]) -> bool:
+        has_high = any(f.severity is Severity.HIGH for f in findings)
+        return score >= self._min_passing_score and not has_high
 
     @staticmethod
     def _open_image(content: bytes) -> Image.Image:
@@ -71,14 +68,14 @@ class RevisorFormato:
             image.load()
         except (UnidentifiedImageError, OSError) as error:
             raise InvalidImageError(
-                "El archivo no es una imagen valida"
+                "El archivo no es una imagen válida"
             ) from error
         return image.convert("RGB")
 
     @staticmethod
     def _score(findings: list[Finding]) -> int:
         penalty = sum(PENALTIES[finding.severity] for finding in findings)
-        return max(0, 100 - penalty)
+        return max(0, MAX_SCORE - penalty)
 
     @staticmethod
     def _summary(

@@ -1,17 +1,3 @@
-"""Fine-tuning de LayoutLMv3 sobre FUNSD para Google Colab.
-
-Entrena ``microsoft/layoutlmv3-base`` en clasificacion de tokens
-(etiquetado de entidades de formularios: HEADER, QUESTION, ANSWER)
-usando el dataset FUNSD y exporta el modelo junto con su procesador
-en un archivo ``.zip`` listo para ser consumido por el servicio
-FastAPI de este proyecto.
-
-Uso en Colab (ver ``training/README.md``):
-    1. Entorno de ejecucion con GPU (T4 es suficiente).
-    2. Celda 1: instalar las dependencias indicadas en el README.
-    3. Celda 2: pegar este archivo completo y ejecutarlo.
-"""
-
 import json
 import random
 import shutil
@@ -33,17 +19,14 @@ from seqeval.metrics import (
     recall_score,
 )
 from transformers import (
-    AutoProcessor,
+    EvalPrediction,
     LayoutLMv3ForTokenClassification,
+    LayoutLMv3Processor,
     Trainer,
     TrainingArguments,
     default_data_collator,
     set_seed,
 )
-
-# ---------------------------------------------------------------------------
-# Configuracion
-# ---------------------------------------------------------------------------
 
 LABELS = [
     "O",
@@ -57,17 +40,18 @@ LABELS = [
 LABEL2ID = {label: idx for idx, label in enumerate(LABELS)}
 ID2LABEL = dict(enumerate(LABELS))
 IGNORE_INDEX = -100
+BOX_SCALE = 1000
+METADATA_FILE = "fme_metadata.json"
+
+Document = dict[str, object]
+Feature = dict[str, torch.Tensor]
 
 
 @dataclass(frozen=True)
 class Config:
-    """Parametros del experimento; editar aqui antes de ejecutar."""
-
     base_model: str = "microsoft/layoutlmv3-base"
-    dataset_urls: tuple = (
-        # Enlace directo publicado en github.com/crcresearch/FUNSD
+    dataset_urls: tuple[str, ...] = (
         "https://www.crc.nd.edu/~pmoreira/funsd.zip",
-        # Fuente original, usada como respaldo
         "https://guillaumejaume.github.io/FUNSD/dataset.zip",
     )
     work_dir: Path = Path("/content/work")
@@ -87,27 +71,21 @@ class Config:
     drive_dir: Path = Path("/content/drive/MyDrive/fme-ai-models")
 
     @property
-    def data_dir(self):
+    def data_dir(self) -> Path:
         return self.work_dir / "data"
 
     @property
-    def output_dir(self):
+    def output_dir(self) -> Path:
         return self.work_dir / "checkpoints"
 
     @property
-    def export_dir(self):
+    def export_dir(self) -> Path:
         return self.work_dir / self.export_name
 
 
-# ---------------------------------------------------------------------------
-# Datos
-# ---------------------------------------------------------------------------
-
-
-def download_dataset(config):
-    """Descarga y descomprime FUNSD; devuelve la raiz del dataset."""
+def download_dataset(config: Config) -> Path:
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    existing = _find_dataset_root(config.data_dir)
+    existing = find_dataset_root(config.data_dir)
     if existing is not None:
         print(f"Dataset ya disponible en {existing}")
         return existing
@@ -123,18 +101,17 @@ def download_dataset(config):
             break
         except (OSError, zipfile.BadZipFile) as error:
             last_error = error
-            print(f"  Fallo la descarga: {error}")
+            print(f"  Falló la descarga: {error}")
     else:
         raise RuntimeError("No se pudo descargar FUNSD") from last_error
 
-    root = _find_dataset_root(config.data_dir)
+    root = find_dataset_root(config.data_dir)
     if root is None:
         raise RuntimeError("Estructura de FUNSD no reconocida")
     return root
 
 
-def _find_dataset_root(base):
-    """Busca la carpeta que contiene training_data/ y testing_data/."""
+def find_dataset_root(base: Path) -> Path | None:
     for candidate in base.rglob("training_data"):
         if "__MACOSX" in candidate.parts:
             continue
@@ -144,73 +121,79 @@ def _find_dataset_root(base):
     return None
 
 
-def normalize_box(box, width, height):
-    """Escala una caja [x0, y0, x1, y1] al rango 0-1000 de LayoutLMv3."""
+def normalize_box(box: list[int], width: int, height: int) -> list[int]:
     x0, y0, x1, y1 = box
     scaled = [
-        1000 * x0 / width,
-        1000 * y0 / height,
-        1000 * x1 / width,
-        1000 * y1 / height,
+        BOX_SCALE * x0 / width,
+        BOX_SCALE * y0 / height,
+        BOX_SCALE * x1 / width,
+        BOX_SCALE * y1 / height,
     ]
-    return [int(max(0, min(1000, value))) for value in scaled]
+    return [int(max(0, min(BOX_SCALE, value))) for value in scaled]
 
 
-def load_split(split_dir):
-    """Lee un split de FUNSD como lista de documentos.
+def bio_label(tag: str, position: int) -> str:
+    if tag == "OTHER":
+        return "O"
+    prefix = "B" if position == 0 else "I"
+    return f"{prefix}-{tag}"
 
-    Cada documento es un dict con ``id``, ``image_path``, ``words``,
-    ``boxes`` (normalizadas) y ``labels`` (esquema BIO).
-    """
-    documents = []
+
+def load_document(annotation_path: Path, image_path: Path) -> Document:
+    with Image.open(image_path) as image:
+        width, height = image.size
+    with annotation_path.open(encoding="utf-8") as handle:
+        form = json.load(handle)["form"]
+
+    words, boxes, labels = [], [], []
+    for entity in form:
+        entity_words = [w for w in entity["words"] if w["text"].strip()]
+        tag = entity["label"].upper()
+        for position, word in enumerate(entity_words):
+            words.append(word["text"])
+            boxes.append(normalize_box(word["box"], width, height))
+            labels.append(LABEL2ID[bio_label(tag, position)])
+
+    return {
+        "id": annotation_path.stem,
+        "image_path": str(image_path),
+        "words": words,
+        "boxes": boxes,
+        "labels": labels,
+    }
+
+
+def load_split(split_dir: Path) -> list[Document]:
     annotations = sorted((split_dir / "annotations").glob("*.json"))
-    for annotation_path in annotations:
-        image_path = split_dir / "images" / f"{annotation_path.stem}.png"
-        with Image.open(image_path) as image:
-            width, height = image.size
-        with annotation_path.open(encoding="utf-8") as handle:
-            form = json.load(handle)["form"]
+    return [
+        load_document(path, split_dir / "images" / f"{path.stem}.png")
+        for path in annotations
+    ]
 
-        words, boxes, labels = [], [], []
-        for entity in form:
-            entity_words = [w for w in entity["words"] if w["text"].strip()]
-            tag = entity["label"].upper()
-            for position, word in enumerate(entity_words):
-                words.append(word["text"])
-                boxes.append(normalize_box(word["box"], width, height))
-                if tag == "OTHER":
-                    labels.append("O")
-                elif position == 0:
-                    labels.append(f"B-{tag}")
-                else:
-                    labels.append(f"I-{tag}")
 
-        documents.append({
-            "id": annotation_path.stem,
-            "image_path": str(image_path),
-            "words": words,
-            "boxes": boxes,
-            "labels": [LABEL2ID[label] for label in labels],
-        })
-    return documents
+def split_validation(
+    documents: list[Document], size: int, seed: int
+) -> tuple[list[Document], list[Document]]:
+    shuffled = documents[:]
+    random.Random(seed).shuffle(shuffled)
+    return shuffled[size:], shuffled[:size]
 
 
 class FunsdWindowDataset(torch.utils.data.Dataset):
-    """Documentos codificados en ventanas de ``max_length`` tokens.
-
-    Los documentos que exceden el limite se dividen en ventanas
-    solapadas (``stride``) para no perder palabras por truncamiento.
-    """
-
-    def __init__(self, documents, processor, config):
-        self.features = []
+    def __init__(
+        self,
+        documents: list[Document],
+        processor: LayoutLMv3Processor,
+        config: Config,
+    ):
+        self.features: list[Feature] = []
         for document in documents:
-            self.features.extend(
-                self._encode(document, processor, config)
-            )
+            self.features.extend(self._encode(document, processor, config))
 
     @staticmethod
-    def _encode(document, processor, config):
+    def _encode(
+        document: Document, processor: LayoutLMv3Processor, config: Config
+    ) -> list[Feature]:
         with Image.open(document["image_path"]) as image:
             pixel_values = processor.image_processor(
                 image.convert("RGB"), return_tensors="pt"
@@ -227,38 +210,27 @@ class FunsdWindowDataset(torch.utils.data.Dataset):
             return_overflowing_tokens=True,
             return_tensors="pt",
         )
-        windows = []
-        for index in range(encoding["input_ids"].shape[0]):
-            windows.append({
+        return [
+            {
                 "input_ids": encoding["input_ids"][index],
                 "attention_mask": encoding["attention_mask"][index],
                 "bbox": encoding["bbox"][index],
                 "labels": encoding["labels"][index],
                 "pixel_values": pixel_values,
-            })
-        return windows
+            }
+            for index in range(encoding["input_ids"].shape[0])
+        ]
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.features)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Feature:
         return self.features[index]
 
 
-def split_validation(documents, size, seed):
-    """Separa ``size`` documentos de entrenamiento para validacion."""
-    shuffled = documents[:]
-    random.Random(seed).shuffle(shuffled)
-    return shuffled[size:], shuffled[:size]
-
-
-# ---------------------------------------------------------------------------
-# Metricas
-# ---------------------------------------------------------------------------
-
-
-def to_label_sequences(predictions, label_ids):
-    """Convierte logits/ids en secuencias de etiquetas sin padding."""
+def to_label_sequences(
+    predictions: np.ndarray, label_ids: np.ndarray
+) -> tuple[list[list[str]], list[list[str]]]:
     predicted_ids = np.argmax(predictions, axis=-1)
     true_sequences, predicted_sequences = [], []
     for predicted_row, label_row in zip(predicted_ids, label_ids):
@@ -270,7 +242,7 @@ def to_label_sequences(predictions, label_ids):
     return true_sequences, predicted_sequences
 
 
-def compute_metrics(eval_prediction):
+def compute_metrics(eval_prediction: EvalPrediction) -> dict[str, float]:
     predictions, label_ids = eval_prediction
     true_seq, predicted_seq = to_label_sequences(predictions, label_ids)
     return {
@@ -280,12 +252,12 @@ def compute_metrics(eval_prediction):
     }
 
 
-# ---------------------------------------------------------------------------
-# Entrenamiento
-# ---------------------------------------------------------------------------
-
-
-def build_trainer(config, processor, train_dataset, eval_dataset):
+def build_trainer(
+    config: Config,
+    processor: LayoutLMv3Processor,
+    train_dataset: FunsdWindowDataset,
+    eval_dataset: FunsdWindowDataset,
+) -> Trainer:
     model = LayoutLMv3ForTokenClassification.from_pretrained(
         config.base_model,
         num_labels=len(LABELS),
@@ -323,22 +295,10 @@ def build_trainer(config, processor, train_dataset, eval_dataset):
     )
 
 
-# ---------------------------------------------------------------------------
-# Exportacion
-# ---------------------------------------------------------------------------
-
-
-def export_model(config, trainer, processor, test_metrics):
-    """Guarda modelo, procesador y metadatos; devuelve la ruta del zip."""
-    export_dir = config.export_dir
-    if export_dir.exists():
-        shutil.rmtree(export_dir)
-    export_dir.mkdir(parents=True)
-
-    trainer.save_model(str(export_dir))
-    processor.save_pretrained(str(export_dir))
-
-    metadata = {
+def build_metadata(
+    config: Config, test_metrics: dict[str, float]
+) -> dict[str, object]:
+    return {
         "name": config.export_name,
         "base_model": config.base_model,
         "task": "token-classification",
@@ -358,21 +318,40 @@ def export_model(config, trainer, processor, test_metrics):
             key: str(value) for key, value in asdict(config).items()
         },
     }
-    metadata_path = export_dir / "fme_metadata.json"
-    with metadata_path.open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2, ensure_ascii=False)
 
-    archive = shutil.make_archive(
-        str(export_dir), "zip", root_dir=export_dir
+
+def export_model(
+    config: Config,
+    trainer: Trainer,
+    processor: LayoutLMv3Processor,
+    test_metrics: dict[str, float],
+) -> Path:
+    export_dir = config.export_dir
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.mkdir(parents=True)
+
+    trainer.save_model(str(export_dir))
+    processor.save_pretrained(str(export_dir))
+    metadata_path = export_dir / METADATA_FILE
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            build_metadata(config, test_metrics),
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    archive = Path(
+        shutil.make_archive(str(export_dir), "zip", root_dir=export_dir)
     )
     print(f"Modelo exportado en {archive}")
-
     if config.copy_to_drive:
-        _copy_to_drive(config, Path(archive))
-    return Path(archive)
+        copy_to_drive(config, archive)
+    return archive
 
 
-def _copy_to_drive(config, archive):
+def copy_to_drive(config: Config, archive: Path) -> None:
     from google.colab import drive
 
     drive.mount("/content/drive")
@@ -382,8 +361,7 @@ def _copy_to_drive(config, archive):
     print(f"Copia guardada en Google Drive: {target}")
 
 
-def offer_download(archive):
-    """Inicia la descarga del zip si se ejecuta dentro de Colab."""
+def offer_download(archive: Path) -> None:
     if "google.colab" not in sys.modules:
         return
     from google.colab import files
@@ -391,12 +369,7 @@ def offer_download(archive):
     files.download(str(archive))
 
 
-# ---------------------------------------------------------------------------
-# Punto de entrada
-# ---------------------------------------------------------------------------
-
-
-def main(config=None):
+def main(config: Config | None = None) -> Path:
     config = config or Config()
     set_seed(config.seed)
     print(f"GPU disponible: {torch.cuda.is_available()}")
@@ -408,11 +381,11 @@ def main(config=None):
         train_docs, config.validation_docs, config.seed
     )
     print(
-        f"Documentos -> train: {len(train_docs)}, "
-        f"validacion: {len(validation_docs)}, test: {len(test_docs)}"
+        f"Documentos -> entrenamiento: {len(train_docs)}, "
+        f"validación: {len(validation_docs)}, prueba: {len(test_docs)}"
     )
 
-    processor = AutoProcessor.from_pretrained(
+    processor = LayoutLMv3Processor.from_pretrained(
         config.base_model, apply_ocr=False
     )
     train_dataset = FunsdWindowDataset(train_docs, processor, config)
@@ -431,7 +404,7 @@ def main(config=None):
         test_output.predictions, test_output.label_ids
     )
     print(classification_report(true_seq, predicted_seq, digits=4))
-    print(f"Metricas en test: {test_output.metrics}")
+    print(f"Métricas en prueba: {test_output.metrics}")
 
     archive = export_model(config, trainer, processor, test_output.metrics)
     offer_download(archive)

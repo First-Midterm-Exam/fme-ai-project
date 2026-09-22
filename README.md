@@ -13,15 +13,35 @@ imagen ──► OCR (Tesseract) ──► LayoutLMv3 (entidades) ──► regl
 
 ```
 app/
-├── main.py                 # create_app(): rutas, lifespan, manejo de errores
-├── core/                   # configuracion (.env) y seguridad (X-API-Key)
-├── api/                    # rutas HTTP e inyeccion de dependencias
-├── schemas/                # contrato JSON expuesto a Laravel
-├── domain/                 # modelos y excepciones sin dependencias externas
-└── services/               # OCR, modelo, tipos de documento, reglas, revisor
-training/                   # script de fine-tuning para Google Colab
-tests/                      # pruebas con OCR y modelo simulados
+├── main.py                     create_app(): rutas, lifespan y errores
+├── container.py                construccion de dependencias (composition root)
+├── core/                       configuracion (.env) y logging
+├── api/                        capa HTTP
+│   ├── dependencies.py         inyeccion de configuracion y revisor
+│   ├── security.py             validacion de X-API-Key
+│   ├── errors.py               excepciones de dominio -> codigos HTTP
+│   └── routes/                 documents.py, health.py
+├── schemas/                    contrato JSON expuesto a Laravel
+├── domain/                     nucleo sin dependencias de frameworks
+│   ├── models.py               Word, Entity, Finding, ReviewResult...
+│   ├── ports.py                interfaces OcrEngine y EntityExtractor
+│   ├── bio.py                  decodificacion de etiquetas BIO
+│   └── exceptions.py
+├── services/                   casos de uso
+│   ├── format_reviewer.py      orquesta OCR + modelo + reglas
+│   ├── rules.py                reglas de formato
+│   └── document_types.py       catalogo de productos de trabajo CMMI
+└── infrastructure/             adaptadores externos
+    ├── tesseract_ocr.py        OcrEngine con Tesseract
+    ├── layoutlmv3_extractor.py EntityExtractor con LayoutLMv3
+    └── model_store.py          instalacion del modelo desde .zip
+training/                       script de fine-tuning para Google Colab
+tests/                          pruebas con OCR y modelo simulados
 ```
+
+Las dependencias apuntan hacia `domain/`: `services/` solo conoce las
+interfaces de `domain/ports.py`, y `container.py` es el unico lugar que
+conecta las implementaciones de `infrastructure/`.
 
 ## Instalacion
 
@@ -44,7 +64,26 @@ tests/                      # pruebas con OCR y modelo simulados
    pip install -r requirements-dev.txt
    ```
 
+   `requirements.txt` instala torch en version CPU mediante
+   `--extra-index-url`; para GPU, quitar esa linea y el sufijo `+cpu`.
+
 3. `copy .env.example .env` y ajustar valores.
+
+## Configuracion (`.env`)
+
+| Variable | Descripcion |
+| --- | --- |
+| `APP_VERSION` | Version reportada en `/` y `/health`. |
+| `API_PREFIX` | Prefijo de las rutas de negocio (`/api/v1`). |
+| `API_KEY` | Clave compartida con Laravel (cabecera `X-API-Key`). Vacia = sin autenticacion. |
+| `LOG_LEVEL` | Nivel de logging (`INFO`, `DEBUG`, ...). |
+| `MODEL_DIR` | Carpeta del modelo; tambien acepta `<MODEL_DIR>.zip`. |
+| `MODEL_DEVICE` | `cpu` o `cuda`. |
+| `OCR_LANGUAGES` | Idiomas de Tesseract (`spa+eng`). |
+| `TESSERACT_CMD` | Ruta del ejecutable si no esta en el PATH. |
+| `TESSDATA_DIR` | Carpeta de idiomas propia; vacia = la de Tesseract. |
+| `MAX_UPLOAD_MB` | Tamano maximo de la imagen. |
+| `MIN_PASSING_SCORE` | Puntaje minimo para `cumple = true`. |
 
 ## Modelo
 
@@ -150,11 +189,18 @@ pytest
 flake8
 ```
 
+`flake8` (configurado en `setup.cfg`) aplica PEP 8 en modo estricto: lineas
+de 79 caracteres, docstrings de 72, complejidad ciclomatica maxima 10 y
+convenciones de nombres (`pep8-naming`).
+
 ## Extender
 
 - **Nuevo tipo de documento**: agregar un `DocumentType` en
   `app/services/document_types.py`.
 - **Nueva regla**: escribir una funcion `RuleContext -> Finding | None` en
   `app/services/rules.py` y agregarla a `DEFAULT_RULES`.
-- **Otro motor OCR**: implementar el protocolo `OcrEngine` y usarlo en
-  `app/api/dependencies.py`.
+- **Otro motor OCR o modelo**: implementar `OcrEngine` o `EntityExtractor`
+  (`app/domain/ports.py`) en `app/infrastructure/` y conectarlo en
+  `app/container.py`.
+- **Nuevo endpoint**: crear un router en `app/api/routes/` y registrarlo en
+  `app/main.py`.

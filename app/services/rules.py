@@ -1,9 +1,3 @@
-"""Reglas de formato evaluadas sobre el analisis de un documento.
-
-Cada regla es una funcion independiente que devuelve un hallazgo o
-``None``; agregar, quitar o ajustar una regla no afecta a las demas.
-"""
-
 from collections.abc import Callable
 from dataclasses import dataclass
 
