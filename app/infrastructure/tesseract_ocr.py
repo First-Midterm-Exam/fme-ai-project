@@ -1,8 +1,5 @@
-"""Extraccion de palabras y cajas mediante OCR."""
-
 import os
 from pathlib import Path
-from typing import Protocol
 
 import pytesseract
 from PIL import Image
@@ -10,19 +7,14 @@ from PIL import Image
 from app.domain.exceptions import OcrUnavailableError
 from app.domain.models import Word
 
-
-class OcrEngine(Protocol):
-    def extract(self, image: Image.Image) -> list[Word]:
-        """Devuelve las palabras en orden de lectura."""
+BOX_SCALE = 1000
 
 
 def normalize_box(
     left: int, top: int, right: int, bottom: int, width: int, height: int
 ) -> tuple[int, int, int, int]:
-    """Escala una caja en pixeles al rango 0-1000 usado por LayoutLMv3."""
-
     def scale(value: int, size: int) -> int:
-        return int(max(0, min(1000, 1000 * value / size)))
+        return int(max(0, min(BOX_SCALE, BOX_SCALE * value / size)))
 
     return (
         scale(left, width),
@@ -33,8 +25,6 @@ def normalize_box(
 
 
 class TesseractOcr:
-    """Motor OCR basado en Tesseract (mismo que usa LayoutLMv3)."""
-
     def __init__(
         self,
         languages: str,
@@ -42,34 +32,17 @@ class TesseractOcr:
         tessdata_dir: Path | None = None,
     ):
         self._languages = languages
-        # Carpeta de idiomas propia (no requiere permisos de administrador).
-        # Se usa la variable de entorno porque ``--tessdata-dir`` pierde las
-        # comillas en Windows y falla con rutas que contienen espacios.
         if tessdata_dir:
             os.environ["TESSDATA_PREFIX"] = str(tessdata_dir.resolve())
         if tesseract_cmd:
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
     def extract(self, image: Image.Image) -> list[Word]:
-        try:
-            data = pytesseract.image_to_data(
-                image,
-                lang=self._languages,
-                output_type=pytesseract.Output.DICT,
-            )
-        except pytesseract.TesseractNotFoundError as error:
-            raise OcrUnavailableError(
-                "Tesseract no esta instalado o no esta en el PATH"
-            ) from error
-        except pytesseract.TesseractError as error:
-            raise OcrUnavailableError(
-                f"Tesseract fallo: {error.message}"
-            ) from error
-
+        data = self._read_data(image)
         width, height = image.size
         words = []
-        for index, text in enumerate(data["text"]):
-            text = text.strip()
+        for index, raw_text in enumerate(data["text"]):
+            text = raw_text.strip()
             if not text or float(data["conf"][index]) < 0:
                 continue
             left, top = data["left"][index], data["top"][index]
@@ -83,3 +56,19 @@ class TesseractOcr:
             )
             words.append(Word(text=text, box=box))
         return words
+
+    def _read_data(self, image: Image.Image) -> dict[str, list]:
+        try:
+            return pytesseract.image_to_data(
+                image,
+                lang=self._languages,
+                output_type=pytesseract.Output.DICT,
+            )
+        except pytesseract.TesseractNotFoundError as error:
+            raise OcrUnavailableError(
+                "Tesseract no está instalado o no está en el PATH"
+            ) from error
+        except pytesseract.TesseractError as error:
+            raise OcrUnavailableError(
+                f"Tesseract falló: {error.message}"
+            ) from error

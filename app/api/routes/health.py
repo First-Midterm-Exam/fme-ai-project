@@ -1,24 +1,20 @@
-"""Estado del servicio."""
+from fastapi import APIRouter, Request
 
-from typing import Annotated
-
-from fastapi import APIRouter, Depends, Request
-
-from app.core.config import Settings, get_settings
-from app.schemas.revision import HealthResponse
+from app.api.dependencies import SettingsDep
+from app.schemas.health import HealthResponse
 
 router = APIRouter(tags=["salud"])
 
 
 @router.get("/health", response_model=HealthResponse)
-def health(
-    request: Request,
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> HealthResponse:
-    loaded = getattr(request.app.state, "revisor", None) is not None
+def health(request: Request, settings: SettingsDep) -> HealthResponse:
+    """
+    Indica si el servicio está operativo y si el modelo fue cargado.
+    """
+    loaded = request.app.state.reviewer is not None
     return HealthResponse(
         status="ok" if loaded else "degraded",
         version=settings.app_version,
         model_loaded=loaded,
-        detail=getattr(request.app.state, "revisor_error", None),
+        detail=request.app.state.reviewer_error,
     )

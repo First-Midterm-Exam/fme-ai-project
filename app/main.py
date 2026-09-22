@@ -1,36 +1,22 @@
-"""Punto de entrada de la aplicacion FastAPI."""
-
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 
-from app.api.dependencies import init_revisor
-from app.api.routes import documentos, health
-from app.core.config import Settings, get_settings
-from app.domain.exceptions import (
-    InvalidImageError,
-    ModelUnavailableError,
-    OcrUnavailableError,
-    RevisionError,
-)
-
-ERROR_STATUS = {
-    InvalidImageError: status.HTTP_422_UNPROCESSABLE_CONTENT,
-    OcrUnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
-    ModelUnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
-}
+from app.api.errors import register_exception_handlers
+from app.api.routes import documents, health
+from app.container import init_app_state
+from app.core.config import Settings
+from app.core.logging import configure_logging
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or get_settings()
-    logging.basicConfig(level=logging.INFO)
+    settings = settings or Settings()
+    configure_logging(settings.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        init_revisor(app, settings)
+        init_app_state(app, settings)
         yield
 
     app = FastAPI(
@@ -38,17 +24,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=settings.app_version,
         lifespan=lifespan,
     )
-
-    @app.exception_handler(RevisionError)
-    async def handle_revision_error(
-        request: Request, error: RevisionError
-    ) -> JSONResponse:
-        return JSONResponse(
-            status_code=ERROR_STATUS.get(
-                type(error), status.HTTP_500_INTERNAL_SERVER_ERROR
-            ),
-            content={"detail": str(error)},
-        )
+    register_exception_handlers(app)
 
     @app.get("/", include_in_schema=False)
     def root() -> str:
@@ -58,7 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     app.include_router(health.router)
-    app.include_router(documentos.router, prefix=settings.api_prefix)
+    app.include_router(documents.router, prefix=settings.api_prefix)
     return app
 
 

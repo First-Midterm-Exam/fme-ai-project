@@ -3,7 +3,7 @@ import zipfile
 import pytest
 
 from app.domain.exceptions import ModelUnavailableError
-from app.services.entity_extractor import SOURCE_MARKER, resolve_model_dir
+from app.infrastructure.model_store import SOURCE_MARKER, prepare_model_dir
 
 
 def write_zip(path, files):
@@ -17,7 +17,7 @@ def test_uses_existing_folder_without_zip(tmp_path):
     model_dir.mkdir()
     (model_dir / "config.json").write_text("{}")
 
-    assert resolve_model_dir(model_dir) == model_dir
+    assert prepare_model_dir(model_dir) == model_dir
 
 
 def test_new_zip_replaces_existing_model(tmp_path):
@@ -27,7 +27,7 @@ def test_new_zip_replaces_existing_model(tmp_path):
     (model_dir / "obsoleto.bin").write_text("x")
     write_zip(tmp_path / "modelo.zip", {"config.json": "nuevo"})
 
-    resolve_model_dir(model_dir)
+    prepare_model_dir(model_dir)
 
     assert (model_dir / "config.json").read_text() == "nuevo"
     assert not (model_dir / "obsoleto.bin").exists()
@@ -37,10 +37,10 @@ def test_new_zip_replaces_existing_model(tmp_path):
 def test_same_zip_is_not_extracted_twice(tmp_path):
     model_dir = tmp_path / "modelo"
     write_zip(tmp_path / "modelo.zip", {"config.json": "v1"})
-    resolve_model_dir(model_dir)
+    prepare_model_dir(model_dir)
     (model_dir / "config.json").write_text("sin tocar")
 
-    resolve_model_dir(model_dir)
+    prepare_model_dir(model_dir)
 
     assert (model_dir / "config.json").read_text() == "sin tocar"
 
@@ -49,7 +49,7 @@ def test_zip_with_nested_folder_is_supported(tmp_path):
     model_dir = tmp_path / "modelo"
     write_zip(tmp_path / "modelo.zip", {"export/config.json": "{}"})
 
-    resolve_model_dir(model_dir)
+    prepare_model_dir(model_dir)
 
     assert (model_dir / "config.json").is_file()
 
@@ -61,11 +61,12 @@ def test_invalid_zip_keeps_current_model(tmp_path):
     (tmp_path / "modelo.zip").write_text("no es zip")
 
     with pytest.raises(ModelUnavailableError):
-        resolve_model_dir(model_dir)
+        prepare_model_dir(model_dir)
 
     assert (model_dir / "config.json").read_text() == "actual"
+    assert not (tmp_path / "modelo.tmp").exists()
 
 
 def test_missing_model_raises(tmp_path):
     with pytest.raises(ModelUnavailableError):
-        resolve_model_dir(tmp_path / "modelo")
+        prepare_model_dir(tmp_path / "modelo")

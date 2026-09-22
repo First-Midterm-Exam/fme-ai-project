@@ -1,5 +1,3 @@
-"""Modelos de dominio independientes del framework web y del modelo ML."""
-
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -18,16 +16,12 @@ class Severity(StrEnum):
 
 @dataclass(frozen=True)
 class Word:
-    """Palabra detectada por OCR con su caja normalizada a 0-1000."""
-
     text: str
     box: tuple[int, int, int, int]
 
 
 @dataclass(frozen=True)
 class Entity:
-    """Grupo de palabras consecutivas con la misma etiqueta."""
-
     type: EntityType
     text: str
     confidence: float
@@ -35,8 +29,6 @@ class Entity:
 
 @dataclass(frozen=True)
 class DocumentAnalysis:
-    """Resultado de OCR + modelo sobre una imagen."""
-
     words: tuple[Word, ...]
     entities: tuple[Entity, ...]
 
