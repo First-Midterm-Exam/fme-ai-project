@@ -1,0 +1,40 @@
+{
+  "info": {
+    "name": "FME AI Service",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {"key": "baseUrl", "value": "http://127.0.0.1:8000"},
+    {"key": "apiKey", "value": ""}
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/health"
+      }
+    },
+    {
+      "name": "Revision de formato",
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "X-API-Key", "value": "{{apiKey}}"},
+          {"key": "Accept", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "imagen",
+              "type": "file",
+              "src": "docs/samples/acta_reunion.png"
+            }
+          ]
+        },
+        "url": "{{baseUrl}}/api/v1/documentos/revision-formato"
+      }
+    }
+  ]
+}
